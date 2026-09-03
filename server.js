@@ -19,11 +19,12 @@ const server = http.createServer(async (req, res) => {
         return res.end();
     }
 
-    // Health Check endpoint for Render
-    if (url.pathname === "/health" || url.pathname === "/api/health") {
+    // Health Check endpoint for Render and local probing
+    if (url.pathname === "/" || url.pathname === "/health" || url.pathname === "/api/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ 
             status: "ok", 
+            service: "buy-roblox-search-backend",
             message: "Buy Roblox API Backend is healthy and running!", 
             timestamp: new Date().toISOString() 
         }));
