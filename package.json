@@ -1,19 +1,13 @@
 {
-  "name": "buy-roblox",
+  "name": "buy-roblox-search-backend",
   "version": "1.0.0",
-  "description": "Buy Roblox backend server",
+  "description": "Buy Roblox Player & Avatar Search Backend Proxy",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": [],
-  "type": "commonjs",
-  "dependencies": {
-    "axios": "^1.20.0",
-    "cors": "^2.8.6",
-    "express": "^5.2.1"
-  },
+  "dependencies": {},
   "engines": {
     "node": ">=18.0.0"
   }
