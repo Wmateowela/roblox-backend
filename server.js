@@ -23,6 +23,9 @@ const MAX_PROFILE_CACHE_ENTRIES = 2000;
 const MAX_IN_FLIGHT_SEARCHES = 100;
 const MAX_IN_FLIGHT_PROFILES = 100;
 const MAX_RATE_LIMIT_ENTRIES = 10000;
+// Players returned per search: the exact username first, then keyword
+// suggestions, never more than this (keeps the avatar batch small too).
+const MAX_SEARCH_RESULTS = 7;
 
 class TtlLruCache {
     constructor(maxEntries) {
@@ -326,6 +329,9 @@ async function lookupKeywordUsers(cleanUsername) {
         const response = await fetchRoblox(
             `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(cleanUsername)}&limit=10`,
             {},
+            // Roblox throttles this endpoint hard (429 after the first call in
+            // a long window), so it fails fast here and the batch variant
+            // lookup below fills the list instead of stalling the search.
             { retries: 0, timeoutMs: 3000 }
         );
         if (!response.ok) {
@@ -340,6 +346,78 @@ async function lookupKeywordUsers(cleanUsername) {
         // Keyword results are an optional convenience. Exact username lookup above
         // remains authoritative, so throttling here must not fail the whole request.
         console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
+        return [];
+    }
+}
+
+// --- Name-variant probe -------------------------------------------------
+// Roblox's keyword endpoint (above) is throttled to roughly one call per long
+// window per IP, which is why a search could collapse back to the single
+// exact match. The batch username endpoint is not throttled, so the usual
+// "name+suffix" / "prefix+name" accounts are probed with it instead — that is
+// what keeps a common name showing up to MAX_SEARCH_RESULTS cards.
+const VARIANT_SUFFIXES = [
+    '1', '12', '123', '777', '420', '69', '007', '99', '2', '22', '3', '33',
+    'x', 'xx', 'real', 'official', 'yt', 'tv', 'gg', 'xd', 'pro', 'gaming',
+    'game', 'fan', 'king', 'boy', 'girl', '10', '11', '21', '7', '8', '9',
+    '100', '111', '666', '01', '02'
+];
+const VARIANT_PREFIXES = ['real', 'i', 'the', 'mr', 'im', 'not', 'official', 'x'];
+const VARIANT_MIDDLES = ['1', '123', 'yt', 'gg', 'pro', 'x'];
+const MAX_VARIANT_CANDIDATES = 50;
+
+function buildUsernameCandidates(cleanUsername) {
+    const roots = [];
+    const pushRoot = (root) => {
+        if (root && root.length >= 3 && root.length <= 20 && /^[a-zA-Z0-9_]+$/.test(root)) roots.push(root);
+    };
+
+    // "builder420" probes the plain "builder" family first — those accounts
+    // are far more common than "builder4201".
+    const stripped = cleanUsername.replace(/[0-9_]+$/, '');
+    if (stripped !== cleanUsername) pushRoot(stripped);
+    pushRoot(cleanUsername);
+
+    const seen = new Set([cleanUsername.toLowerCase()]);
+    const candidates = [];
+    const add = (name) => {
+        if (!name || name.length < 3 || name.length > 20) return;
+        if (!/^[a-zA-Z0-9_]+$/.test(name)) return;
+        const key = name.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        candidates.push(name);
+    };
+
+    for (const root of roots) {
+        for (const suffix of VARIANT_SUFFIXES) add(root + suffix);
+        for (const prefix of VARIANT_PREFIXES) add(prefix + root);
+        for (const middle of VARIANT_MIDDLES) add(`${root}_${middle}`);
+        if (candidates.length >= MAX_VARIANT_CANDIDATES) break;
+    }
+
+    return candidates.slice(0, MAX_VARIANT_CANDIDATES);
+}
+
+async function lookupVariantUsers(cleanUsername) {
+    const candidates = buildUsernameCandidates(cleanUsername);
+    if (candidates.length === 0) return [];
+
+    try {
+        const response = await fetchRoblox("https://users.roblox.com/v1/usernames/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ usernames: candidates, excludeBannedUsers: false })
+        }, { retries: 0, timeoutMs: 3500 });
+        if (!response.ok) {
+            throw new RobloxUpstreamError(`Roblox username API returned ${response.status}`, { status: response.status });
+        }
+        const payload = await readRobloxJson(response, 'username variant lookup');
+        if (!payload || !Array.isArray(payload.data)) return [];
+        return payload.data.map(normalizeRobloxUser).filter(Boolean);
+    } catch (error) {
+        // Variant probing only tops the list up; a failure must never fail the search.
+        console.warn(`Optional username-variant lookup unavailable: ${error.message}`);
         return [];
     }
 }
@@ -369,8 +447,24 @@ async function fetchAvatarMap(users) {
 }
 
 async function executePlayerSearch(cleanUsername, cacheKey) {
-    let users = await lookupExactUsername(cleanUsername);
-    if (users.length === 0) users = await lookupKeywordUsers(cleanUsername);
+    // The exact username lookup alone can only ever return one player, so the
+    // keyword suggestions and the batch name-variant probe are fetched as well
+    // (in parallel) and merged after it. MAX_SEARCH_RESULTS keeps a search
+    // cheap: at most 7 players, which also caps the avatar batch that follows.
+    const [exactUsers, keywordUsers, variantUsers] = await Promise.all([
+        lookupExactUsername(cleanUsername),
+        lookupKeywordUsers(cleanUsername),
+        lookupVariantUsers(cleanUsername)
+    ]);
+
+    const users = [];
+    const seen = new Set();
+    for (const user of [...exactUsers, ...keywordUsers, ...variantUsers]) {
+        if (!user || seen.has(user.id)) continue;
+        seen.add(user.id);
+        users.push(user);
+        if (users.length >= MAX_SEARCH_RESULTS) break;
+    }
 
     if (users.length === 0) {
         const result = { status: 404, body: { success: false, error: "Player not found" } };
