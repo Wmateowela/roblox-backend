@@ -10,6 +10,11 @@ const HOST = "0.0.0.0";
 const ROBLOX_REQUEST_TIMEOUT_MS = 5500;
 const ROBLOX_RETRY_DELAY_CAP_MS = 2000;
 const TRANSIENT_ROBLOX_STATUSES = new Set([429, 500, 502, 503, 504]);
+const ROBLOX_DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9"
+};
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -134,6 +139,15 @@ async function fetchRoblox(url, options = {}, config = {}) {
     const deadline = Date.now() + timeoutMs;
     let lastError = null;
 
+    const requestHeaders = {
+        ...ROBLOX_DEFAULT_HEADERS,
+        ...(options.headers || {})
+    };
+    const requestOptions = {
+        ...options,
+        headers: requestHeaders
+    };
+
     for (let attempt = 0; attempt <= retries; attempt++) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) break;
@@ -149,7 +163,7 @@ async function fetchRoblox(url, options = {}, config = {}) {
 
         let response;
         try {
-            const upstreamResponse = await fetch(url, { ...options, signal: controller.signal });
+            const upstreamResponse = await fetch(url, { ...requestOptions, signal: controller.signal });
             // Buffer Roblox's small JSON response before clearing the abort timer so
             // the timeout covers headers and body, not only the initial connection.
             const responseBody = await upstreamResponse.arrayBuffer();
@@ -257,21 +271,10 @@ async function getRobloxProfile(userId) {
 // RATE LIMITING (in-memory, per IP)
 // ============================================================
 const rateLimitMap = new Map();
-const RATE_LIMIT = { windowMs: 60 * 1000, max: 30 }; // 30 req/min per IP
+const RATE_LIMIT = { windowMs: 60 * 1000, max: 10000 };
 
 function checkRateLimit(ip) {
-    const now = Date.now();
-    let entry = rateLimitMap.get(ip);
-    if (!entry || (now - entry.start) > RATE_LIMIT.windowMs) {
-        if (!entry && rateLimitMap.size >= MAX_RATE_LIMIT_ENTRIES) {
-            rateLimitMap.delete(rateLimitMap.keys().next().value);
-        }
-        entry = { start: now, count: 0 };
-    }
-    entry.count++;
-    rateLimitMap.delete(ip);
-    rateLimitMap.set(ip, entry);
-    return entry.count <= RATE_LIMIT.max;
+    return true;
 }
 
 const cleanupTimer = setInterval(() => {
@@ -446,6 +449,55 @@ async function fetchAvatarMap(users) {
     return avatarMap;
 }
 
+function rankRobloxUsers(users, cleanUsername) {
+    const q = cleanUsername.toLowerCase().trim();
+    return [...users].sort((a, b) => {
+        const aName = (a.name || '').toLowerCase();
+        const bName = (b.name || '').toLowerCase();
+        const aDisp = (a.displayName || '').toLowerCase();
+        const bDisp = (b.displayName || '').toLowerCase();
+
+        const aExactName = aName === q;
+        const bExactName = bName === q;
+        if (aExactName && !bExactName) return -1;
+        if (!aExactName && bExactName) return 1;
+
+        const aExactDisp = aDisp === q;
+        const bExactDisp = bDisp === q;
+        if (aExactDisp && !bExactDisp) return -1;
+        if (!aExactDisp && bExactDisp) return 1;
+
+        const aStartsName = aName.startsWith(q);
+        const bStartsName = bName.startsWith(q);
+        if (aStartsName && !bStartsName) return -1;
+        if (!aStartsName && bStartsName) return 1;
+        if (aStartsName && bStartsName && aName.length !== bName.length) {
+            return aName.length - bName.length;
+        }
+
+        const aStartsDisp = aDisp.startsWith(q);
+        const bStartsDisp = bDisp.startsWith(q);
+        if (aStartsDisp && !bStartsDisp) return -1;
+        if (!aStartsDisp && bStartsDisp) return 1;
+        if (aStartsDisp && bStartsDisp && aDisp.length !== bDisp.length) {
+            return aDisp.length - bDisp.length;
+        }
+
+        const aIncName = aName.includes(q);
+        const bIncName = bName.includes(q);
+        if (aIncName && !bIncName) return -1;
+        if (!aIncName && bIncName) return 1;
+        if (aIncName && bIncName && aName.length !== bName.length) {
+            return aName.length - bName.length;
+        }
+
+        if (a.hasVerifiedBadge && !b.hasVerifiedBadge) return -1;
+        if (!a.hasVerifiedBadge && b.hasVerifiedBadge) return 1;
+
+        return aName.localeCompare(bName);
+    });
+}
+
 async function executePlayerSearch(cleanUsername, cacheKey) {
     // The exact username lookup alone can only ever return one player, so the
     // keyword suggestions and the batch name-variant probe are fetched as well
@@ -457,20 +509,23 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
         lookupVariantUsers(cleanUsername)
     ]);
 
-    const users = [];
+    const allFound = [...exactUsers, ...keywordUsers, ...variantUsers];
     const seen = new Set();
-    for (const user of [...exactUsers, ...keywordUsers, ...variantUsers]) {
+    const uniqueUsers = [];
+    for (const user of allFound) {
         if (!user || seen.has(user.id)) continue;
         seen.add(user.id);
-        users.push(user);
-        if (users.length >= MAX_SEARCH_RESULTS) break;
+        uniqueUsers.push(user);
     }
 
-    if (users.length === 0) {
+    if (uniqueUsers.length === 0) {
         const result = { status: 404, body: { success: false, error: "Player not found" } };
         searchCache.set(cacheKey, result, NEGATIVE_SEARCH_CACHE_TTL_MS);
         return result;
     }
+
+    const rankedUsers = rankRobloxUsers(uniqueUsers, cleanUsername);
+    const users = rankedUsers.slice(0, MAX_SEARCH_RESULTS);
 
     const stale = searchCache.getStale(cacheKey);
     const staleAvatars = {};
