@@ -208,7 +208,13 @@ async function fetchRoblox(url, options = {}, config = {}) {
                 status: response.status,
                 retryAfterMs
             });
-            if (response.status === 429) noteRobloxRateLimit();
+            if (response.status === 429) {
+                // Only user-facing search endpoints trigger the global brake;
+                // avatar image calls 429 too often and would block everything.
+                if (/users\.roblox\.com\/v1\/(usernames\/users|users\/search|users\/\d)/.test(url)) {
+                    noteRobloxRateLimit();
+                }
+            }
         }
 
         if (attempt >= retries) {
