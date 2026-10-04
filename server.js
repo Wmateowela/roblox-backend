@@ -121,6 +121,22 @@ let robloxUsernamePool = null;
 // cooldown. Otherwise every search pays the timeout/retry cost for suggestions
 // that Roblox will never return, making the site feel slow.
 let keywordSearchCooldownUntil = 0;
+// Shared upstream brake: when Roblox 429-throttles ANY endpoint, all Roblox
+// calls pause for a cooldown instead of burning retries on every request.
+let robloxRateLimitCooldownUntil = 0;
+let robloxCooldownLogAt = 0;
+function noteRobloxRateLimit() {
+    robloxRateLimitCooldownUntil = Date.now() + 60 * 1000;
+    keywordSearchCooldownUntil = robloxRateLimitCooldownUntil;
+    const now = Date.now();
+    if (now - robloxCooldownLogAt > 55 * 1000) {
+        robloxCooldownLogAt = now;
+        console.warn('Roblox rate-limited us (429). Pausing all Roblox API calls for 60s.');
+    }
+}
+function robloxCooldownRemainingMs() {
+    return Math.max(0, robloxRateLimitCooldownUntil - Date.now());
+}
 
 function parseRetryAfterMs(value) {
     if (!value) return null;
@@ -192,6 +208,7 @@ async function fetchRoblox(url, options = {}, config = {}) {
                 status: response.status,
                 retryAfterMs
             });
+            if (response.status === 429) noteRobloxRateLimit();
         }
 
         if (attempt >= retries) {
@@ -227,6 +244,13 @@ async function getRobloxProfile(userId) {
     const id = String(userId);
     const cached = profileCache.getFresh(id);
     if (cached) return cached.value;
+
+    const cooldown = robloxCooldownRemainingMs();
+    if (cooldown > 0) {
+        const staleNow = profileCache.getStale(id);
+        if (staleNow && staleNow.value) return staleNow.value;
+        throw new RobloxUpstreamError('Roblox API rate-limited; cooling down', { status: 429, retryAfterMs: cooldown });
+    }
 
     if (profileInFlight.has(id)) return profileInFlight.get(id);
     if (profileInFlight.size >= MAX_IN_FLIGHT_PROFILES) {
@@ -381,6 +405,9 @@ function normalizeRobloxUser(user) {
 }
 
 async function lookupExactUsername(cleanUsername) {
+    if (robloxCooldownRemainingMs() > 0) {
+        throw new RobloxUpstreamError('Roblox API rate-limited; cooling down', { status: 429, retryAfterMs: robloxCooldownRemainingMs() });
+    }
     const response = await fetchRoblox("https://users.roblox.com/v1/usernames/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -446,9 +473,8 @@ async function lookupKeywordUsers(cleanUsername) {
         // Keyword results are an optional convenience. Exact username lookup above
         // remains authoritative, so throttling here must not fail the whole request.
         if (error && error.status === 429) {
-            keywordSearchCooldownUntil = Date.now() + 60 * 1000;
+            noteRobloxRateLimit();
             keywordCache.set(cacheKey, [], 30 * 1000);
-            console.warn('Optional Roblox keyword search throttled (429). Pausing keyword lookups for 60s.');
         } else {
             keywordCache.set(cacheKey, [], 30 * 1000);
             console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
