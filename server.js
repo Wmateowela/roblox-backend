@@ -113,6 +113,7 @@ class ServiceBusyError extends Error {
 const searchCache = new TtlLruCache(MAX_SEARCH_CACHE_ENTRIES);
 const profileCache = new TtlLruCache(MAX_PROFILE_CACHE_ENTRIES);
 const keywordCache = new TtlLruCache(500);
+const fallbackCache = new TtlLruCache(500);
 const searchInFlight = new Map();
 const profileInFlight = new Map();
 const friendBootstrapDailyMap = new Map();
@@ -408,6 +409,81 @@ async function lookupExactUsernames(usernames) {
     return payload.data.map(normalizeRobloxUser).filter(Boolean);
 }
 
+// Roblox rate-limits the keyword search endpoint hard for datacenter IPs
+// (Render gets 429 with roughly one success per 25s), while the exact
+// username POST endpoint keeps working from the same IP. These query-derived
+// variants therefore restore the full player list on Render: they are resolved
+// through the POST endpoint, and only names that really exist on Roblox are
+// returned to the client.
+const USERNAME_VARIANT_SUFFIXES = [
+    '123', '1', '11', '01', '99', '007', '12', '7', '21', '2010', '2009',
+    '2011', '456', '789', '111', '222', '0', '5', '10', '9', '100',
+    'x', 'y', 'z', 'xy', 'pl', 'yt', 'roblox', 'gaming', 'playz',
+    'official', 'real', 'the', '2007', '2008', '1234', '1337', '098'
+];
+
+const MAX_SUGGESTION_CANDIDATES = 60;
+
+function buildSuggestionCandidates(cleanUsername) {
+    const needle = cleanUsername.toLowerCase();
+    const seen = new Set();
+    const candidates = [];
+    const push = (value) => {
+        const key = String(value).toLowerCase();
+        // Only names that contain the query are useful suggestions: the rank
+        // function pins the exact match first and these sort right after it.
+        if (!key.includes(needle) || seen.has(key)) return;
+        if (!/^[a-zA-Z0-9_]{3,20}$/.test(value)) return;
+        seen.add(key);
+        candidates.push(value);
+    };
+
+    // The exact username itself is never a candidate: executePlayerSearch
+    // already resolved it, and a name Roblox just reported as missing cannot
+    // reappear in the variant batch.
+    for (const suffix of USERNAME_VARIANT_SUFFIXES) push(cleanUsername + suffix);
+    push(`${cleanUsername}_${cleanUsername.length}`);
+
+    try {
+        for (const name of getRobloxUsernamePool()) {
+            if (candidates.length >= MAX_SUGGESTION_CANDIDATES) break;
+            push(name);
+        }
+    } catch (error) {
+        // The pool is only a secondary source; variants alone still fill the list.
+        console.warn(`Local username pool unavailable: ${error.message}`);
+    }
+
+    return candidates.slice(0, MAX_SUGGESTION_CANDIDATES);
+}
+
+async function lookupFallbackSuggestions(cleanUsername) {
+    const cacheKey = cleanUsername.toLowerCase();
+    const cached = fallbackCache.getFresh(cacheKey);
+    // An empty cached value is a real answer too: retrying a failed batch on
+    // every keystroke would exhaust the POST endpoint that exact lookups need.
+    if (cached) return cached.value;
+
+    const candidates = buildSuggestionCandidates(cleanUsername);
+    if (!candidates.length) {
+        fallbackCache.set(cacheKey, [], 30 * 1000);
+        return [];
+    }
+
+    // One batch call keeps the fallback inside a single round trip, so a
+    // throttled keyword search never doubles the search latency.
+    const resolved = await lookupExactUsernames(candidates);
+    const needle = cleanUsername.toLowerCase();
+    const suggestions = resolved
+        .filter(user => user && user.name && user.name.toLowerCase().includes(needle))
+        .slice(0, MAX_SEARCH_RESULTS);
+
+    // Suggestions are real Roblox accounts and stay valid for minutes; an
+    // empty batch only proves the variants are free right now.
+    fallbackCache.set(cacheKey, suggestions, suggestions.length ? 5 * 60 * 1000 : 60 * 1000);
+    return suggestions;
+}
+
 async function lookupKeywordUsers(cleanUsername) {
     const cacheKey = cleanUsername.toLowerCase();
     const cached = keywordCache.getFresh(cacheKey);
@@ -435,11 +511,10 @@ async function lookupKeywordUsers(cleanUsername) {
     } catch (error) {
         // Keyword results are an optional convenience. Exact username lookup above
         // remains authoritative, so throttling here must not fail the whole request.
+        keywordCache.set(cacheKey, [], 30 * 1000);
         if (error && error.status === 429) {
-            keywordCache.set(cacheKey, [], 30 * 1000);
             console.warn('Optional Roblox keyword search throttled (429).');
         } else {
-            keywordCache.set(cacheKey, [], 30 * 1000);
             console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
         }
         return [];
@@ -577,7 +652,7 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
     // Resolve the authoritative exact username and similar-name suggestions
     // together. Ranking below always pins the true exact match to the top,
     // while the bounded merge restores the wider player picker list.
-    const [exactResult, keywordUsers] = await Promise.all([
+    const [exactResult, initialKeywordUsers] = await Promise.all([
         lookupExactUsername(cleanUsername)
             .then(users => ({ users }))
             .catch(error => ({ error })),
@@ -587,8 +662,28 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
 
     // Both sources empty: if the exact lookup itself blew up, that is an
     // upstream outage (stale cache / 503 path) — not "player not found".
-    if (!exactUsers.length && !keywordUsers.length && exactResult.error) {
+    if (!exactUsers.length && !initialKeywordUsers.length && exactResult.error) {
         throw exactResult.error;
+    }
+
+    let keywordUsers = initialKeywordUsers;
+
+    // Roblox's keyword endpoint is rate-limited for datacenter IPs, so a
+    // Render instance mostly gets 429 there while its exact-username endpoint
+    // still answers. Without this second pass the deployed list shows only
+    // the exact match where localhost shows twelve players.
+    if (!keywordUsers.length) {
+        try {
+            const suggestions = await lookupFallbackSuggestions(cleanUsername);
+            if (suggestions.length) {
+                keywordUsers = suggestions;
+                // Share with concurrent/repeat searches: the keyword cache is
+                // the single source for suggestions across all callers.
+                keywordCache.set(cleanUsername.toLowerCase(), suggestions, 5 * 60 * 1000);
+            }
+        } catch (error) {
+            console.warn(`Suggestion fallback failed: ${error.message}`);
+        }
     }
 
     const merged = [];
