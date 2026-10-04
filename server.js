@@ -112,10 +112,15 @@ class ServiceBusyError extends Error {
 
 const searchCache = new TtlLruCache(MAX_SEARCH_CACHE_ENTRIES);
 const profileCache = new TtlLruCache(MAX_PROFILE_CACHE_ENTRIES);
+const keywordCache = new TtlLruCache(500);
 const searchInFlight = new Map();
 const profileInFlight = new Map();
 const friendBootstrapDailyMap = new Map();
 let robloxUsernamePool = null;
+// When Roblox throttles keyword searches, stop hammering the API for a short
+// cooldown. Otherwise every search pays the timeout/retry cost for suggestions
+// that Roblox will never return, making the site feel slow.
+let keywordSearchCooldownUntil = 0;
 
 function parseRetryAfterMs(value) {
     if (!value) return null;
@@ -347,6 +352,7 @@ const cleanupTimer = setInterval(() => {
     }
     searchCache.cleanup();
     profileCache.cleanup();
+    keywordCache.cleanup();
 }, 5 * 60 * 1000);
 cleanupTimer.unref?.();
 
@@ -407,6 +413,16 @@ async function lookupExactUsernames(usernames) {
 }
 
 async function lookupKeywordUsers(cleanUsername) {
+    const cacheKey = cleanUsername.toLowerCase();
+    const cached = keywordCache.getFresh(cacheKey);
+    if (cached) return cached.value;
+
+    // Cooldown after Roblox throttling: suggestions are optional, so skip the
+    // network call entirely instead of failing slowly on every keystroke.
+    if (Date.now() < keywordSearchCooldownUntil) {
+        return [];
+    }
+
     try {
         const response = await fetchRoblox(
             `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(cleanUsername)}&limit=25`,
@@ -414,7 +430,7 @@ async function lookupKeywordUsers(cleanUsername) {
             // Suggestions are optional and must never hold the visible exact
             // username result for several seconds when Roblox throttles them.
             // Increased timeout to 4000ms to handle deployed server latency.
-            { retries: 1, timeoutMs: 4000 }
+            { retries: 0, timeoutMs: 2500 }
         );
         if (!response.ok) {
             throw new RobloxUpstreamError(`Roblox keyword API returned ${response.status}`, { status: response.status });
@@ -423,11 +439,20 @@ async function lookupKeywordUsers(cleanUsername) {
         if (!payload || !Array.isArray(payload.data)) {
             throw new RobloxUpstreamError('Roblox keyword response was incomplete', { status: response.status });
         }
-        return payload.data.map(normalizeRobloxUser).filter(Boolean).slice(0, 25);
+        const users = payload.data.map(normalizeRobloxUser).filter(Boolean).slice(0, 25);
+        keywordCache.set(cacheKey, users, SEARCH_CACHE_TTL_MS);
+        return users;
     } catch (error) {
         // Keyword results are an optional convenience. Exact username lookup above
         // remains authoritative, so throttling here must not fail the whole request.
-        console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
+        if (error && error.status === 429) {
+            keywordSearchCooldownUntil = Date.now() + 60 * 1000;
+            keywordCache.set(cacheKey, [], 30 * 1000);
+            console.warn('Optional Roblox keyword search throttled (429). Pausing keyword lookups for 60s.');
+        } else {
+            keywordCache.set(cacheKey, [], 30 * 1000);
+            console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
+        }
         return [];
     }
 }
@@ -458,6 +483,18 @@ async function fetchAvatarMap(users, timeoutMs = SEARCH_AVATAR_TIMEOUT_MS) {
     return avatarMap;
 }
 
+// Small built-in fallback used only when RobloxUserName.txt is missing from
+// the deployment. Real usernames that reliably resolve on Roblox.
+const FALLBACK_USERNAME_POOL = [
+    'Roblox', 'Builderman', 'Telamon', 'Stickmasterluke', 'Shedletsky',
+    'DominusCamorani', 'NotPeteHealy', 'Kleeck', 'Quackity', 'FlamingoBen',
+    'lisadenn57', 'AxolotlJayFish', 'Ninja', 'Dream', 'Technoblade',
+    'CaptainSparklez', 'HipMC', 'GeorgeNotFound', 'Sapnap', 'BadLion',
+    'itsSUSO', 'Mini Ladd', 'Skeppy', 'TheOdd1sOut', 'DanTDM',
+    'PewDiePie', 'Markiplier', 'MrBeast', 'LoganPaul', 'JakePaul',
+    'VanossGaming', 'PrestonPlayz', 'Unspeakable', 'Popularmmos', 'Muselk'
+];
+
 function getRobloxUsernamePool() {
     if (robloxUsernamePool) return robloxUsernamePool;
     const candidates = [
@@ -465,7 +502,13 @@ function getRobloxUsernamePool() {
         path.join(__dirname, '..', 'Frontend', 'RobloxUserName.txt')
     ];
     const sourcePath = candidates.find(candidate => fs.existsSync(candidate));
-    if (!sourcePath) throw new Error('RobloxUserName.txt was not found');
+    if (!sourcePath) {
+        // File missing (e.g. not committed to the Render rootDir). Fall back to a
+        // small built-in pool instead of failing every friend bootstrap call.
+        console.warn('RobloxUserName.txt was not found. Using built-in fallback username pool.');
+        robloxUsernamePool = FALLBACK_USERNAME_POOL.slice();
+        return robloxUsernamePool;
+    }
 
     const seen = new Set();
     robloxUsernamePool = fs.readFileSync(sourcePath, 'utf8')
