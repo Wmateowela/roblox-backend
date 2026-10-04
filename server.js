@@ -117,26 +117,6 @@ const searchInFlight = new Map();
 const profileInFlight = new Map();
 const friendBootstrapDailyMap = new Map();
 let robloxUsernamePool = null;
-// When Roblox throttles keyword searches, stop hammering the API for a short
-// cooldown. Otherwise every search pays the timeout/retry cost for suggestions
-// that Roblox will never return, making the site feel slow.
-let keywordSearchCooldownUntil = 0;
-// Shared upstream brake: when Roblox 429-throttles ANY endpoint, all Roblox
-// calls pause for a cooldown instead of burning retries on every request.
-let robloxRateLimitCooldownUntil = 0;
-let robloxCooldownLogAt = 0;
-function noteRobloxRateLimit() {
-    robloxRateLimitCooldownUntil = Date.now() + 60 * 1000;
-    keywordSearchCooldownUntil = robloxRateLimitCooldownUntil;
-    const now = Date.now();
-    if (now - robloxCooldownLogAt > 55 * 1000) {
-        robloxCooldownLogAt = now;
-        console.warn('Roblox rate-limited us (429). Pausing all Roblox API calls for 60s.');
-    }
-}
-function robloxCooldownRemainingMs() {
-    return Math.max(0, robloxRateLimitCooldownUntil - Date.now());
-}
 
 function parseRetryAfterMs(value) {
     if (!value) return null;
@@ -208,13 +188,6 @@ async function fetchRoblox(url, options = {}, config = {}) {
                 status: response.status,
                 retryAfterMs
             });
-            if (response.status === 429) {
-                // Only user-facing search endpoints trigger the global brake;
-                // avatar image calls 429 too often and would block everything.
-                if (/users\.roblox\.com\/v1\/(usernames\/users|users\/search|users\/\d)/.test(url)) {
-                    noteRobloxRateLimit();
-                }
-            }
         }
 
         if (attempt >= retries) {
@@ -250,13 +223,6 @@ async function getRobloxProfile(userId) {
     const id = String(userId);
     const cached = profileCache.getFresh(id);
     if (cached) return cached.value;
-
-    const cooldown = robloxCooldownRemainingMs();
-    if (cooldown > 0) {
-        const staleNow = profileCache.getStale(id);
-        if (staleNow && staleNow.value) return staleNow.value;
-        throw new RobloxUpstreamError('Roblox API rate-limited; cooling down', { status: 429, retryAfterMs: cooldown });
-    }
 
     if (profileInFlight.has(id)) return profileInFlight.get(id);
     if (profileInFlight.size >= MAX_IN_FLIGHT_PROFILES) {
@@ -411,9 +377,6 @@ function normalizeRobloxUser(user) {
 }
 
 async function lookupExactUsername(cleanUsername) {
-    if (robloxCooldownRemainingMs() > 0) {
-        throw new RobloxUpstreamError('Roblox API rate-limited; cooling down', { status: 429, retryAfterMs: robloxCooldownRemainingMs() });
-    }
     const response = await fetchRoblox("https://users.roblox.com/v1/usernames/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -450,12 +413,6 @@ async function lookupKeywordUsers(cleanUsername) {
     const cached = keywordCache.getFresh(cacheKey);
     if (cached) return cached.value;
 
-    // Cooldown after Roblox throttling: suggestions are optional, so skip the
-    // network call entirely instead of failing slowly on every keystroke.
-    if (Date.now() < keywordSearchCooldownUntil) {
-        return [];
-    }
-
     try {
         const response = await fetchRoblox(
             `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(cleanUsername)}&limit=25`,
@@ -479,8 +436,8 @@ async function lookupKeywordUsers(cleanUsername) {
         // Keyword results are an optional convenience. Exact username lookup above
         // remains authoritative, so throttling here must not fail the whole request.
         if (error && error.status === 429) {
-            noteRobloxRateLimit();
             keywordCache.set(cacheKey, [], 30 * 1000);
+            console.warn('Optional Roblox keyword search throttled (429).');
         } else {
             keywordCache.set(cacheKey, [], 30 * 1000);
             console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
@@ -711,7 +668,13 @@ function sendTemporaryFailure(res, error, operation) {
     const retryAfterSeconds = busy
         ? 2
         : Math.max(1, Math.min(5, Math.ceil((error.retryAfterMs || 1000) / 1000)));
-    console.error(`${operation}: ${error.message}`);
+    // Cooldown errors repeat for every request during a pause. Log only the
+    // first one so the Render log stays readable; the client still gets the 503.
+    const isCooldown = error.message && error.message.includes('cooling down');
+    if (!isCooldown || Date.now() - (sendTemporaryFailure._lastCooldownLog || 0) > 55000) {
+        if (isCooldown) sendTemporaryFailure._lastCooldownLog = Date.now();
+        console.error(`${operation}: ${error.message}`);
+    }
     return sendJson(res, 503, {
         success: false,
         error: busy
