@@ -413,7 +413,8 @@ async function lookupKeywordUsers(cleanUsername) {
             {},
             // Suggestions are optional and must never hold the visible exact
             // username result for several seconds when Roblox throttles them.
-            { retries: 0, timeoutMs: 1800 }
+            // Increased timeout to 4000ms to handle deployed server latency.
+            { retries: 1, timeoutMs: 4000 }
         );
         if (!response.ok) {
             throw new RobloxUpstreamError(`Roblox keyword API returned ${response.status}`, { status: response.status });
