@@ -513,7 +513,10 @@ async function lookupKeywordUsers(cleanUsername) {
         // remains authoritative, so throttling here must not fail the whole request.
         keywordCache.set(cacheKey, [], 30 * 1000);
         if (error && error.status === 429) {
-            console.warn('Optional Roblox keyword search throttled (429).');
+            if (Date.now() - (lookupKeywordUsers._lastCooldownLog || 0) > 55000) {
+                lookupKeywordUsers._lastCooldownLog = Date.now();
+                console.warn('Optional Roblox keyword search throttled (429).');
+            }
         } else {
             console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
         }
@@ -667,6 +670,7 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
     }
 
     let keywordUsers = initialKeywordUsers;
+    let fallbackFailed = false;
 
     // Roblox's keyword endpoint is rate-limited for datacenter IPs, so a
     // Render instance mostly gets 429 there while its exact-username endpoint
@@ -683,6 +687,7 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
             }
         } catch (error) {
             console.warn(`Suggestion fallback failed: ${error.message}`);
+            fallbackFailed = true;
         }
     }
 
@@ -696,7 +701,8 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
     const users = rankSearchResults(merged, cleanUsername).slice(0, MAX_SEARCH_RESULTS);
 
     if (users.length === 0) {
-        const result = { status: 404, body: { success: false, error: "Player not found" } };
+        // Return 200 OK with success: false to prevent browser console red errors
+        const result = { status: 200, body: { success: false, error: "Player not found" } };
         searchCache.set(cacheKey, result, NEGATIVE_SEARCH_CACHE_TTL_MS);
         return result;
     }
@@ -730,7 +736,8 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
         status: 200,
         body: { success: true, count: results.length, users: results }
     };
-    searchCache.set(cacheKey, result, SEARCH_CACHE_TTL_MS, SEARCH_CACHE_STALE_MS);
+    const ttl = fallbackFailed ? 15 * 1000 : SEARCH_CACHE_TTL_MS;
+    searchCache.set(cacheKey, result, ttl, SEARCH_CACHE_STALE_MS);
     return result;
 }
 
@@ -765,12 +772,13 @@ function sendTemporaryFailure(res, error, operation) {
         : Math.max(1, Math.min(5, Math.ceil((error.retryAfterMs || 1000) / 1000)));
     // Cooldown errors repeat for every request during a pause. Log only the
     // first one so the Render log stays readable; the client still gets the 503.
-    const isCooldown = error.message && error.message.includes('cooling down');
+    const isCooldown = (error.message && error.message.includes('cooling down')) || error.status === 429;
     if (!isCooldown || Date.now() - (sendTemporaryFailure._lastCooldownLog || 0) > 55000) {
         if (isCooldown) sendTemporaryFailure._lastCooldownLog = Date.now();
         console.error(`${operation}: ${error.message}`);
     }
-    return sendJson(res, 503, {
+    // Return 200 instead of 503 to prevent revealing API url in browser console
+    return sendJson(res, 200, {
         success: false,
         error: busy
             ? "Search service is busy. Please try again shortly."
@@ -859,13 +867,15 @@ async function handleRequest(req, res) {
         const username = url.searchParams.get("username");
 
         if (!username || !username.trim()) {
-            return sendJson(res, 400, { success: false, error: "Username is required" });
+            return sendJson(res, 200, { success: false, error: "Username is required" });
         }
 
         const cleanUsername = username.trim();
         if (cleanUsername.length > 20 || !/^[a-zA-Z0-9_]+$/.test(cleanUsername)) {
-            return sendJson(res, 400, { success: false, error: "Invalid username format." });
+            return sendJson(res, 200, { success: false, error: "Invalid username format." });
         }
+
+        console.log(`[Search] User is searching for: "${cleanUsername}"`);
 
         try {
             const result = await getPlayerSearchResult(cleanUsername);
@@ -888,26 +898,26 @@ async function handleRequest(req, res) {
         const username = url.searchParams.get("username");
 
         if ((!userId || !userId.trim()) && (!username || !username.trim())) {
-            return sendJson(res, 400, { success: false, error: "userId or username is required" });
+            return sendJson(res, 200, { success: false, error: "userId or username is required" });
         }
 
         try {
             if (!userId && username) {
                 const cleanUsername = username.trim();
                 if (cleanUsername.length > 20 || !/^[a-zA-Z0-9_]+$/.test(cleanUsername)) {
-                    return sendJson(res, 400, { success: false, error: "Invalid username format." });
+                    return sendJson(res, 200, { success: false, error: "Invalid username format." });
                 }
                 const users = await lookupExactUsername(cleanUsername);
                 if (users.length > 0) userId = String(users[0].id);
             }
 
             if (!userId || !/^\d+$/.test(userId)) {
-                return sendJson(res, 404, { success: false, error: "Player not found" });
+                return sendJson(res, 200, { success: false, error: "Player not found" });
             }
 
             const userData = await getRobloxProfile(userId.trim());
             if (!userData) {
-                return sendJson(res, 404, { success: false, error: "Player not found" });
+                return sendJson(res, 200, { success: false, error: "Player not found" });
             }
 
             return sendJson(res, 200, {
