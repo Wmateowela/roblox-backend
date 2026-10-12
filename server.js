@@ -27,6 +27,7 @@ const GLOBAL_SEARCH_RATE_LIMIT = { windowMs: 1000, max: 100 };
 const DEVICE_SEARCH_ABUSE_LIMIT = { windowMs: 1000, max: 50 };
 const SEARCH_ABUSE_BLOCK_MS = 10 * 60 * 1000;
 const SEARCH_AVATAR_TIMEOUT_MS = 750;
+const SEARCH_AVATAR_REPAIR_TIMEOUT_MS = 3500;
 const FRIEND_BOOTSTRAP_SIZE = 15;
 const FRIEND_BOOTSTRAP_CANDIDATES = 50;
 const FRIEND_BOOTSTRAP_DAILY_LIMIT = 10;
@@ -581,16 +582,24 @@ async function lookupIndexedSuggestions(cleanUsername) {
     });
 }
 
-async function fetchAvatarMap(users, timeoutMs = SEARCH_AVATAR_TIMEOUT_MS) {
+async function fetchAvatarMap(users, timeoutMs = SEARCH_AVATAR_TIMEOUT_MS, config = {}) {
     const avatarMap = {};
     if (!users.length) return avatarMap;
-    const userIds = users.map(user => user.id).join(',');
+    const userIds = [...new Set(users
+        .map(user => Number(user && user.id))
+        .filter(id => Number.isSafeInteger(id) && id > 0))]
+        .join(',');
+    if (!userIds) return avatarMap;
     const response = await fetchRoblox(
         `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${encodeURIComponent(userIds)}&size=150x150&format=Png&isCircular=true`,
         {},
         // A thumbnail is cosmetic. Never make a valid player wait several
         // seconds when Roblox's image service is slow or throttled.
-        { retries: 0, timeoutMs }
+        {
+            retries: Number.isInteger(config.retries) ? config.retries : 0,
+            timeoutMs,
+            endpointKey: config.endpointKey || 'thumbnails'
+        }
     );
     if (!response.ok) {
         throw new RobloxUpstreamError(`Roblox thumbnail API returned ${response.status}`, { status: response.status });
@@ -600,7 +609,7 @@ async function fetchAvatarMap(users, timeoutMs = SEARCH_AVATAR_TIMEOUT_MS) {
         throw new RobloxUpstreamError('Roblox thumbnail response was incomplete', { status: response.status });
     }
     for (const item of payload.data) {
-        if (item && item.targetId && typeof item.imageUrl === 'string' && item.imageUrl) {
+        if (item && item.targetId && item.state === 'Completed' && typeof item.imageUrl === 'string' && item.imageUrl) {
             avatarMap[item.targetId] = item.imageUrl;
         }
     }
@@ -850,7 +859,7 @@ async function handleRequest(req, res) {
 
     // Search-only budget: profile details and health probes do not count as a
     // new player search. This keeps the one-search/one-count rule predictable.
-    if (url.pathname === "/api/search-player") {
+    if (url.pathname === "/api/search-player" || url.pathname === "/api/player-avatars") {
         const ip = getClientIp(req);
         const limit = checkSearchRateLimit(ip);
         if (!limit.allowed) {
@@ -864,6 +873,53 @@ async function handleRequest(req, res) {
                 retryable: !limit.abuse,
                 retryAfter
             }, { "Retry-After": String(retryAfter) });
+        }
+    }
+
+    // Search normally returns thumbnails in the same response. This endpoint is
+    // a one-batch fallback used only when Roblox's thumbnail service missed its
+    // fast 750ms budget. It prevents every card from showing the same generic
+    // picture without creating one request per player.
+    if (url.pathname === "/api/player-avatars") {
+        if (req.method !== "GET") {
+            return sendJson(res, 405, { success: false, error: "Method not allowed" }, { "Allow": "GET" });
+        }
+
+        const rawIds = String(url.searchParams.get("userIds") || "").split(',').filter(Boolean);
+        if (!rawIds.length || rawIds.length > MAX_SEARCH_RESULTS || rawIds.some(id => !/^\d+$/.test(id))) {
+            return sendJson(res, 400, {
+                success: false,
+                error: "Enter between 1 and 12 valid Roblox user IDs.",
+                code: "INVALID_USER_IDS",
+                retryable: false
+            });
+        }
+
+        const users = [...new Set(rawIds.map(Number))]
+            .filter(id => Number.isSafeInteger(id) && id > 0)
+            .map(id => ({ id }));
+        if (!users.length) {
+            return sendJson(res, 400, {
+                success: false,
+                error: "Enter between 1 and 12 valid Roblox user IDs.",
+                code: "INVALID_USER_IDS",
+                retryable: false
+            });
+        }
+
+        try {
+            // This repair attempt deliberately has no shared thumbnail circuit:
+            // it is already bounded, rate-limited, and only runs after a miss.
+            const avatars = await fetchAvatarMap(users, SEARCH_AVATAR_REPAIR_TIMEOUT_MS, {
+                retries: 1,
+                endpointKey: 'thumbnailRepair'
+            });
+            return sendJson(res, 200, { success: true, avatars });
+        } catch (error) {
+            console.warn(`Roblox thumbnail repair unavailable: ${error.message}`);
+            // Missing artwork is cosmetic; keep this a successful empty result so
+            // the browser does not report a noisy red network error.
+            return sendJson(res, 200, { success: true, avatars: {} });
         }
     }
 
