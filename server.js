@@ -27,6 +27,13 @@ const GLOBAL_SEARCH_RATE_LIMIT = { windowMs: 1000, max: 100 };
 const DEVICE_SEARCH_ABUSE_LIMIT = { windowMs: 1000, max: 50 };
 const SEARCH_ABUSE_BLOCK_MS = 10 * 60 * 1000;
 const SEARCH_AVATAR_TIMEOUT_MS = 1000;
+// Roblox's keyword endpoint is heavily throttled for shared hosting IPs.
+// It is only an optional source of extra suggestions, so probe it at most once
+// per interval across the server instead of once for every visitor.
+const KEYWORD_PROBE_INTERVAL_MS = Math.max(
+    5000,
+    parseInt(process.env.ROBLOX_KEYWORD_PROBE_INTERVAL_MS || '30000', 10) || 30000
+);
 const FRIEND_BOOTSTRAP_SIZE = 15;
 const FRIEND_BOOTSTRAP_CANDIDATES = 50;
 const FRIEND_BOOTSTRAP_DAILY_LIMIT = 10;
@@ -113,7 +120,7 @@ class ServiceBusyError extends Error {
 const searchCache = new TtlLruCache(MAX_SEARCH_CACHE_ENTRIES);
 const profileCache = new TtlLruCache(MAX_PROFILE_CACHE_ENTRIES);
 const keywordCache = new TtlLruCache(500);
-const fallbackCache = new TtlLruCache(500);
+let nextKeywordProbeAt = 0;
 const searchInFlight = new Map();
 const profileInFlight = new Map();
 const friendBootstrapDailyMap = new Map();
@@ -546,12 +553,10 @@ async function lookupExactUsernames(usernames) {
     return payload.data.map(normalizeRobloxUser).filter(Boolean);
 }
 
-// Roblox rate-limits the keyword search endpoint hard for datacenter IPs
-// (Render gets 429 with roughly one success per 25s), while the exact
-// username POST endpoint keeps working from the same IP. These query-derived
-// variants therefore restore the full player list on Render: they are resolved
-// through the POST endpoint, and only names that really exist on Roblox are
-// returned to the client.
+// Roblox rate-limits the keyword search endpoint hard for datacenter IPs,
+// while the username batch endpoint keeps working from the same IP. These
+// query-derived variants let one batch resolve the exact player and similar
+// real accounts without depending on the throttled endpoint.
 const USERNAME_VARIANT_SUFFIXES = [
     '123', '1', '11', '01', '99', '007', '12', '7', '21', '2010', '2009',
     '2011', '456', '789', '111', '222', '0', '5', '10', '9', '100',
@@ -563,23 +568,36 @@ const MAX_SUGGESTION_CANDIDATES = 60;
 
 function buildSuggestionCandidates(cleanUsername) {
     const needle = cleanUsername.toLowerCase();
+    const root = cleanUsername.replace(/[0-9]+$/, '').replace(/_+$/, '');
+    const rootNeedle = root.toLowerCase();
     const seen = new Set();
     const candidates = [];
     const push = (value) => {
         const key = String(value).toLowerCase();
         // Only names that contain the query are useful suggestions: the rank
         // function pins the exact match first and these sort right after it.
-        if (!key.includes(needle) || seen.has(key)) return;
+        const relatedToQuery = key.includes(needle)
+            || (rootNeedle.length >= 3 && rootNeedle !== needle && key.includes(rootNeedle));
+        if (!relatedToQuery || seen.has(key)) return;
         if (!/^[a-zA-Z0-9_]{3,20}$/.test(value)) return;
         seen.add(key);
         candidates.push(value);
     };
 
-    // The exact username itself is never a candidate: executePlayerSearch
-    // already resolved it, and a name Roblox just reported as missing cannot
-    // reappear in the variant batch.
+    // Variants of the full query work well for names such as "player8" ->
+    // "player89". Variants of the text root also find nearby numbered users
+    // such as "player24" -> "player23" or "player25".
     for (const suffix of USERNAME_VARIANT_SUFFIXES) push(cleanUsername + suffix);
     push(`${cleanUsername}_${cleanUsername.length}`);
+    if (root.length >= 3 && root.toLowerCase() !== needle) {
+        const numberMatch = cleanUsername.match(/([0-9]+)$/);
+        const number = numberMatch ? Number(numberMatch[1]) : NaN;
+        if (Number.isSafeInteger(number)) {
+            if (number > 0) push(`${root}${number - 1}`);
+            push(`${root}${number + 1}`);
+        }
+        for (const suffix of USERNAME_VARIANT_SUFFIXES) push(root + suffix);
+    }
 
     try {
         for (const name of getRobloxUsernamePool()) {
@@ -594,37 +612,21 @@ function buildSuggestionCandidates(cleanUsername) {
     return candidates.slice(0, MAX_SUGGESTION_CANDIDATES);
 }
 
-async function lookupFallbackSuggestions(cleanUsername) {
-    const cacheKey = cleanUsername.toLowerCase();
-    const cached = fallbackCache.getFresh(cacheKey);
-    // An empty cached value is a real answer too: retrying a failed batch on
-    // every keystroke would exhaust the POST endpoint that exact lookups need.
-    if (cached) return cached.value;
-
-    const candidates = buildSuggestionCandidates(cleanUsername);
-    if (!candidates.length) {
-        fallbackCache.set(cacheKey, [], 30 * 1000);
-        return [];
-    }
-
-    // One batch call keeps the fallback inside a single round trip, so a
-    // throttled keyword search never doubles the search latency.
-    const resolved = await lookupExactUsernames(candidates);
-    const needle = cleanUsername.toLowerCase();
-    const suggestions = resolved
-        .filter(user => user && user.name && user.name.toLowerCase().includes(needle))
-        .slice(0, MAX_SEARCH_RESULTS);
-
-    // Suggestions are real Roblox accounts and stay valid for minutes; an
-    // empty batch only proves the variants are free right now.
-    fallbackCache.set(cacheKey, suggestions, suggestions.length ? 5 * 60 * 1000 : 60 * 1000);
-    return suggestions;
+async function lookupSearchUserBatch(cleanUsername) {
+    const usernames = [cleanUsername, ...buildSuggestionCandidates(cleanUsername)]
+        .filter((value, index, values) => values.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index)
+        .slice(0, 100);
+    return lookupExactUsernames(usernames);
 }
 
 async function lookupKeywordUsers(cleanUsername) {
     const cacheKey = cleanUsername.toLowerCase();
     const cached = keywordCache.getFresh(cacheKey);
     if (cached) return cached.value;
+
+    const now = Date.now();
+    if (now < nextKeywordProbeAt) return [];
+    nextKeywordProbeAt = now + KEYWORD_PROBE_INTERVAL_MS;
 
     try {
         const response = await fetchRoblox(
@@ -649,6 +651,9 @@ async function lookupKeywordUsers(cleanUsername) {
         // Keyword results are an optional convenience. Exact username lookup above
         // remains authoritative, so throttling here must not fail the whole request.
         keywordCache.set(cacheKey, [], 30 * 1000);
+        if (error && Number.isFinite(error.retryAfterMs)) {
+            nextKeywordProbeAt = Math.max(nextKeywordProbeAt, Date.now() + error.retryAfterMs);
+        }
         if (error && error.status === 429) {
             if (Date.now() - (lookupKeywordUsers._lastCooldownLog || 0) > 55000) {
                 lookupKeywordUsers._lastCooldownLog = Date.now();
@@ -789,48 +794,26 @@ function rankSearchResults(users, cleanUsername) {
 }
 
 async function executePlayerSearch(cleanUsername, cacheKey) {
-    // Resolve the authoritative exact username and similar-name suggestions
-    // together. Ranking below always pins the true exact match to the top,
-    // while the bounded merge restores the wider player picker list.
-    const [exactResult, initialKeywordUsers] = await Promise.all([
-        lookupExactUsername(cleanUsername)
+    // Resolve the exact username and query-derived alternatives in one Roblox
+    // batch. The keyword endpoint is optional, globally paced, and never
+    // required for a successful player result.
+    const [batchResult, keywordUsers] = await Promise.all([
+        lookupSearchUserBatch(cleanUsername)
             .then(users => ({ users }))
             .catch(error => ({ error })),
         lookupKeywordUsers(cleanUsername)
     ]);
-    const exactUsers = exactResult.users || [];
+    const batchUsers = batchResult.users || [];
 
     // Both sources empty: if the exact lookup itself blew up, that is an
     // upstream outage (stale cache / 503 path) — not "player not found".
-    if (!exactUsers.length && !initialKeywordUsers.length && exactResult.error) {
-        throw exactResult.error;
-    }
-
-    let keywordUsers = initialKeywordUsers;
-    let fallbackFailed = false;
-
-    // Roblox's keyword endpoint is rate-limited for datacenter IPs, so a
-    // Render instance mostly gets 429 there while its exact-username endpoint
-    // still answers. Without this second pass the deployed list shows only
-    // the exact match where localhost shows twelve players.
-    if (!keywordUsers.length) {
-        try {
-            const suggestions = await lookupFallbackSuggestions(cleanUsername);
-            if (suggestions.length) {
-                keywordUsers = suggestions;
-                // Share with concurrent/repeat searches: the keyword cache is
-                // the single source for suggestions across all callers.
-                keywordCache.set(cleanUsername.toLowerCase(), suggestions, 5 * 60 * 1000);
-            }
-        } catch (error) {
-            console.warn(`Suggestion fallback failed: ${error.message}`);
-            fallbackFailed = true;
-        }
+    if (!batchUsers.length && !keywordUsers.length && batchResult.error) {
+        throw batchResult.error;
     }
 
     const merged = [];
     const seen = new Set();
-    for (const user of [...exactUsers, ...keywordUsers]) {
+    for (const user of [...batchUsers, ...keywordUsers]) {
         if (!user || seen.has(user.id)) continue;
         seen.add(user.id);
         merged.push(user);
@@ -873,8 +856,7 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
         status: 200,
         body: { success: true, count: results.length, users: results }
     };
-    const ttl = fallbackFailed ? 15 * 1000 : SEARCH_CACHE_TTL_MS;
-    searchCache.set(cacheKey, result, ttl, SEARCH_CACHE_STALE_MS);
+    searchCache.set(cacheKey, result, SEARCH_CACHE_TTL_MS, SEARCH_CACHE_STALE_MS);
     return result;
 }
 
@@ -1125,12 +1107,14 @@ function createServer() {
 function resetStateForTests() {
     searchCache.clear();
     profileCache.clear();
+    keywordCache.clear();
     searchInFlight.clear();
     profileInFlight.clear();
     rateLimitMap.clear();
     searchAbuseBlocks.clear();
     friendBootstrapDailyMap.clear();
     globalSearchWindow = { start: 0, count: 0 };
+    nextKeywordProbeAt = 0;
 }
 
 if (require.main === module) {
