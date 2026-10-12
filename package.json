@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test tests/search-backend.test.js"
+    "test": "node --test tests/search-backend.test.js tests/search-resilience.test.js"
   },
   "dependencies": {},
   "engines": {

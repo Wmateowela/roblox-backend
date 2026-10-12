@@ -140,7 +140,117 @@ async function cancelResponseBody(response) {
     try { await response.body.cancel(); } catch (error) { /* ignore cleanup errors */ }
 }
 
-async function fetchRoblox(url, options = {}, config = {}) {
+// ============================================================
+// OUTBOUND ROBLOX CONCURRENCY QUEUE & CIRCUIT BREAKERS (Phase 6)
+// ============================================================
+const ROBLOX_MAX_CONCURRENT = parseInt(process.env.ROBLOX_MAX_CONCURRENT || '12', 10);
+const ROBLOX_MAX_QUEUE_LENGTH = parseInt(process.env.ROBLOX_MAX_QUEUE_LENGTH || '30', 10);
+let activeOutboundCount = 0;
+const outboundQueue = [];
+
+const searchMetrics = {
+    inboundSearches: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    coalescedRequests: 0,
+    upstreamCalls: 0,
+    queueOverflows: 0,
+    circuitTrips: 0,
+    droppedOptionalWork: 0
+};
+
+class EndpointCircuitBreaker {
+    constructor(name, failureThreshold = 5, cooldownMs = 25000) {
+        this.name = name;
+        this.failureThreshold = failureThreshold;
+        this.cooldownMs = cooldownMs;
+        this.state = 'CLOSED'; // 'CLOSED', 'OPEN', 'HALF_OPEN'
+        this.consecutiveFailures = 0;
+        this.lastFailureTime = 0;
+    }
+
+    canExecute() {
+        if (this.state === 'OPEN') {
+            if (Date.now() - this.lastFailureTime > this.cooldownMs) {
+                this.state = 'HALF_OPEN';
+                return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    recordSuccess() {
+        this.consecutiveFailures = 0;
+        this.state = 'CLOSED';
+    }
+
+    recordFailure(error) {
+        this.consecutiveFailures++;
+        this.lastFailureTime = Date.now();
+        if (this.consecutiveFailures >= this.failureThreshold || this.state === 'HALF_OPEN') {
+            if (this.state !== 'OPEN') searchMetrics.circuitTrips++;
+            this.state = 'OPEN';
+        }
+    }
+
+    getRetryAfterMs() {
+        if (this.state !== 'OPEN') return 0;
+        return Math.max(0, (this.lastFailureTime + this.cooldownMs) - Date.now());
+    }
+}
+
+const circuitBreakers = {
+    usernames: new EndpointCircuitBreaker('usernames', 5, 20000),
+    keyword: new EndpointCircuitBreaker('keyword', 3, 30000),
+    thumbnails: new EndpointCircuitBreaker('thumbnails', 4, 20000),
+    profile: new EndpointCircuitBreaker('profile', 5, 20000)
+};
+
+function getEndpointKey(url) {
+    if (url.includes('/usernames/users')) return 'usernames';
+    if (url.includes('/users/search')) return 'keyword';
+    if (url.includes('/avatar-headshot')) return 'thumbnails';
+    if (url.includes('/v1/users/')) return 'profile';
+    return 'default';
+}
+
+function executeWithOutboundQueue(action) {
+    return new Promise((resolve, reject) => {
+        if (activeOutboundCount < ROBLOX_MAX_CONCURRENT) {
+            activeOutboundCount++;
+            action().then(resolve, reject).finally(() => {
+                activeOutboundCount--;
+                drainOutboundQueue();
+            });
+            return;
+        }
+
+        if (outboundQueue.length >= ROBLOX_MAX_QUEUE_LENGTH) {
+            searchMetrics.queueOverflows++;
+            return reject(new ServiceBusyError('Roblox upstream queue capacity reached'));
+        }
+
+        outboundQueue.push({ action, resolve, reject, enqueuedAt: Date.now() });
+    });
+}
+
+function drainOutboundQueue() {
+    while (activeOutboundCount < ROBLOX_MAX_CONCURRENT && outboundQueue.length > 0) {
+        const item = outboundQueue.shift();
+        if (Date.now() - item.enqueuedAt > 6000) {
+            item.reject(new RobloxUpstreamError('Upstream request timed out in queue'));
+            continue;
+        }
+        activeOutboundCount++;
+        item.action().then(item.resolve, item.reject).finally(() => {
+            activeOutboundCount--;
+            drainOutboundQueue();
+        });
+    }
+}
+
+async function rawFetchRoblox(url, options = {}, config = {}) {
     const retries = Number.isInteger(config.retries) ? config.retries : 1;
     const timeoutMs = config.timeoutMs || ROBLOX_REQUEST_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
@@ -207,6 +317,33 @@ async function fetchRoblox(url, options = {}, config = {}) {
     }
 
     throw lastError || new RobloxUpstreamError('Roblox API request timed out');
+}
+
+async function fetchRoblox(url, options = {}, config = {}) {
+    const endpointKey = getEndpointKey(url);
+    const cb = circuitBreakers[endpointKey];
+    if (cb && !cb.canExecute()) {
+        const retryAfterMs = cb.getRetryAfterMs();
+        if (endpointKey === 'keyword' || endpointKey === 'thumbnails') {
+            searchMetrics.droppedOptionalWork++;
+            throw new RobloxUpstreamError(`Optional ${endpointKey} endpoint circuit open`, { status: 503, retryAfterMs });
+        }
+        throw new RobloxUpstreamError(`Roblox ${endpointKey} service circuit open`, { status: 503, retryAfterMs });
+    }
+
+    return executeWithOutboundQueue(async () => {
+        searchMetrics.upstreamCalls++;
+        try {
+            const res = await rawFetchRoblox(url, options, config);
+            if (cb) cb.recordSuccess();
+            return res;
+        } catch (err) {
+            if (cb && (err.status >= 500 || err.status === 429 || err.name === 'RobloxUpstreamError')) {
+                cb.recordFailure(err);
+            }
+            throw err;
+        }
+    });
 }
 
 async function readRobloxJson(response, operation) {
@@ -701,8 +838,8 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
     const users = rankSearchResults(merged, cleanUsername).slice(0, MAX_SEARCH_RESULTS);
 
     if (users.length === 0) {
-        // Return 200 OK with success: false to prevent browser console red errors
-        const result = { status: 200, body: { success: false, error: "Player not found" } };
+        // Return 404 Not Found for definitive player miss according to established API contract
+        const result = { status: 404, body: { success: false, error: "Player not found", code: "PLAYER_NOT_FOUND", users: [] } };
         searchCache.set(cacheKey, result, NEGATIVE_SEARCH_CACHE_TTL_MS);
         return result;
     }
@@ -777,8 +914,8 @@ function sendTemporaryFailure(res, error, operation) {
         if (isCooldown) sendTemporaryFailure._lastCooldownLog = Date.now();
         console.error(`${operation}: ${error.message}`);
     }
-    // Return 200 instead of 503 to prevent revealing API url in browser console
-    return sendJson(res, 200, {
+    // Return HTTP 503 for retryable upstream failure
+    return sendJson(res, 503, {
         success: false,
         error: busy
             ? "Search service is busy. Please try again shortly."
