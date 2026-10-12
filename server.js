@@ -14,7 +14,7 @@ const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const SEARCH_CACHE_STALE_MS = 60 * 60 * 1000;
-const NEGATIVE_SEARCH_CACHE_TTL_MS = 30 * 1000;
+const NEGATIVE_SEARCH_CACHE_TTL_MS = 2 * 60 * 1000;
 const PROFILE_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROFILE_CACHE_STALE_MS = 60 * 60 * 1000;
 const NEGATIVE_PROFILE_CACHE_TTL_MS = 30 * 1000;
@@ -26,14 +26,7 @@ const MAX_RATE_LIMIT_ENTRIES = 10000;
 const GLOBAL_SEARCH_RATE_LIMIT = { windowMs: 1000, max: 100 };
 const DEVICE_SEARCH_ABUSE_LIMIT = { windowMs: 1000, max: 50 };
 const SEARCH_ABUSE_BLOCK_MS = 10 * 60 * 1000;
-const SEARCH_AVATAR_TIMEOUT_MS = 1000;
-// Roblox's keyword endpoint is heavily throttled for shared hosting IPs.
-// It is only an optional source of extra suggestions, so probe it at most once
-// per interval across the server instead of once for every visitor.
-const KEYWORD_PROBE_INTERVAL_MS = Math.max(
-    5000,
-    parseInt(process.env.ROBLOX_KEYWORD_PROBE_INTERVAL_MS || '30000', 10) || 30000
-);
+const SEARCH_AVATAR_TIMEOUT_MS = 750;
 const FRIEND_BOOTSTRAP_SIZE = 15;
 const FRIEND_BOOTSTRAP_CANDIDATES = 50;
 const FRIEND_BOOTSTRAP_DAILY_LIMIT = 10;
@@ -119,8 +112,6 @@ class ServiceBusyError extends Error {
 
 const searchCache = new TtlLruCache(MAX_SEARCH_CACHE_ENTRIES);
 const profileCache = new TtlLruCache(MAX_PROFILE_CACHE_ENTRIES);
-const keywordCache = new TtlLruCache(500);
-let nextKeywordProbeAt = 0;
 const searchInFlight = new Map();
 const profileInFlight = new Map();
 const friendBootstrapDailyMap = new Map();
@@ -208,14 +199,18 @@ class EndpointCircuitBreaker {
 }
 
 const circuitBreakers = {
-    usernames: new EndpointCircuitBreaker('usernames', 5, 20000),
+    // Exact username lookup deliberately has no circuit breaker. It already
+    // has bounded retries and the global queue; an open circuit here made
+    // valid and missing usernames fail instantly without contacting Roblox.
+    usernamesBatch: new EndpointCircuitBreaker('usernamesBatch', 5, 20000),
+    usernameSuggestions: new EndpointCircuitBreaker('usernameSuggestions', 3, 30000),
     keyword: new EndpointCircuitBreaker('keyword', 3, 30000),
     thumbnails: new EndpointCircuitBreaker('thumbnails', 4, 20000),
     profile: new EndpointCircuitBreaker('profile', 5, 20000)
 };
 
 function getEndpointKey(url) {
-    if (url.includes('/usernames/users')) return 'usernames';
+    if (url.includes('/usernames/users')) return 'usernamesBatch';
     if (url.includes('/users/search')) return 'keyword';
     if (url.includes('/avatar-headshot')) return 'thumbnails';
     if (url.includes('/v1/users/')) return 'profile';
@@ -327,11 +322,11 @@ async function rawFetchRoblox(url, options = {}, config = {}) {
 }
 
 async function fetchRoblox(url, options = {}, config = {}) {
-    const endpointKey = getEndpointKey(url);
+    const endpointKey = config.endpointKey || getEndpointKey(url);
     const cb = circuitBreakers[endpointKey];
     if (cb && !cb.canExecute()) {
         const retryAfterMs = cb.getRetryAfterMs();
-        if (endpointKey === 'keyword' || endpointKey === 'thumbnails') {
+        if (endpointKey === 'keyword' || endpointKey === 'thumbnails' || endpointKey === 'usernameSuggestions') {
             searchMetrics.droppedOptionalWork++;
             throw new RobloxUpstreamError(`Optional ${endpointKey} endpoint circuit open`, { status: 503, retryAfterMs });
         }
@@ -493,7 +488,6 @@ const cleanupTimer = setInterval(() => {
     }
     searchCache.cleanup();
     profileCache.cleanup();
-    keywordCache.cleanup();
 }, 5 * 60 * 1000);
 cleanupTimer.unref?.();
 
@@ -526,7 +520,7 @@ async function lookupExactUsername(cleanUsername) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ usernames: [cleanUsername], excludeBannedUsers: false })
-    }, { retries: 1, timeoutMs: 3500 });
+    }, { retries: 2, timeoutMs: 6000, endpointKey: 'usernamesExact' });
     if (!response.ok) {
         throw new RobloxUpstreamError(`Roblox username API returned ${response.status}`, { status: response.status });
     }
@@ -537,12 +531,16 @@ async function lookupExactUsername(cleanUsername) {
     return payload.data.map(normalizeRobloxUser).filter(Boolean).slice(0, 1);
 }
 
-async function lookupExactUsernames(usernames) {
+async function lookupExactUsernames(usernames, config = {}) {
     const response = await fetchRoblox("https://users.roblox.com/v1/usernames/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ usernames, excludeBannedUsers: false })
-    }, { retries: 1, timeoutMs: 5500 });
+    }, {
+        retries: Number.isInteger(config.retries) ? config.retries : 2,
+        timeoutMs: config.timeoutMs || 6000,
+        endpointKey: config.endpointKey || 'usernamesBatch'
+    });
     if (!response.ok) {
         throw new RobloxUpstreamError(`Roblox username batch API returned ${response.status}`, { status: response.status });
     }
@@ -553,117 +551,34 @@ async function lookupExactUsernames(usernames) {
     return payload.data.map(normalizeRobloxUser).filter(Boolean);
 }
 
-// Roblox rate-limits the keyword search endpoint hard for datacenter IPs,
-// while the username batch endpoint keeps working from the same IP. These
-// query-derived variants let one batch resolve the exact player and similar
-// real accounts without depending on the throttled endpoint.
-const USERNAME_VARIANT_SUFFIXES = [
-    '123', '1', '11', '01', '99', '007', '12', '7', '21', '2010', '2009',
-    '2011', '456', '789', '111', '222', '0', '5', '10', '9', '100',
-    'x', 'y', 'z', 'xy', 'pl', 'yt', 'roblox', 'gaming', 'playz',
-    'official', 'real', 'the', '2007', '2008', '1234', '1337', '098'
-];
-
-const MAX_SUGGESTION_CANDIDATES = 60;
-
-function buildSuggestionCandidates(cleanUsername) {
+function buildIndexedSearchCandidates(cleanUsername) {
     const needle = cleanUsername.toLowerCase();
-    const root = cleanUsername.replace(/[0-9]+$/, '').replace(/_+$/, '');
-    const rootNeedle = root.toLowerCase();
-    const seen = new Set();
-    const candidates = [];
-    const push = (value) => {
-        const key = String(value).toLowerCase();
-        // Only names that contain the query are useful suggestions: the rank
-        // function pins the exact match first and these sort right after it.
-        const relatedToQuery = key.includes(needle)
-            || (rootNeedle.length >= 3 && rootNeedle !== needle && key.includes(rootNeedle));
-        if (!relatedToQuery || seen.has(key)) return;
-        if (!/^[a-zA-Z0-9_]{3,20}$/.test(value)) return;
+    if (needle.length < 3) return [];
+
+    const seen = new Set([needle]);
+    const matches = [];
+    for (const name of getRobloxUsernamePool()) {
+        const candidate = String(name || '').trim();
+        const key = candidate.toLowerCase();
+        if (!key.includes(needle) || seen.has(key)) continue;
+        if (!/^[a-zA-Z0-9_]{3,20}$/.test(candidate)) continue;
         seen.add(key);
-        candidates.push(value);
-    };
-
-    // Variants of the full query work well for names such as "player8" ->
-    // "player89". Variants of the text root also find nearby numbered users
-    // such as "player24" -> "player23" or "player25".
-    for (const suffix of USERNAME_VARIANT_SUFFIXES) push(cleanUsername + suffix);
-    push(`${cleanUsername}_${cleanUsername.length}`);
-    if (root.length >= 3 && root.toLowerCase() !== needle) {
-        const numberMatch = cleanUsername.match(/([0-9]+)$/);
-        const number = numberMatch ? Number(numberMatch[1]) : NaN;
-        if (Number.isSafeInteger(number)) {
-            if (number > 0) push(`${root}${number - 1}`);
-            push(`${root}${number + 1}`);
-        }
-        for (const suffix of USERNAME_VARIANT_SUFFIXES) push(root + suffix);
+        matches.push(candidate);
+        if (matches.length >= 60) break;
     }
-
-    try {
-        for (const name of getRobloxUsernamePool()) {
-            if (candidates.length >= MAX_SUGGESTION_CANDIDATES) break;
-            push(name);
-        }
-    } catch (error) {
-        // The pool is only a secondary source; variants alone still fill the list.
-        console.warn(`Local username pool unavailable: ${error.message}`);
-    }
-
-    return candidates.slice(0, MAX_SUGGESTION_CANDIDATES);
+    return matches;
 }
 
-async function lookupSearchUserBatch(cleanUsername) {
-    const usernames = [cleanUsername, ...buildSuggestionCandidates(cleanUsername)]
-        .filter((value, index, values) => values.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index)
-        .slice(0, 100);
-    return lookupExactUsernames(usernames);
-}
-
-async function lookupKeywordUsers(cleanUsername) {
-    const cacheKey = cleanUsername.toLowerCase();
-    const cached = keywordCache.getFresh(cacheKey);
-    if (cached) return cached.value;
-
-    const now = Date.now();
-    if (now < nextKeywordProbeAt) return [];
-    nextKeywordProbeAt = now + KEYWORD_PROBE_INTERVAL_MS;
-
-    try {
-        const response = await fetchRoblox(
-            `https://users.roblox.com/v1/users/search?keyword=${encodeURIComponent(cleanUsername)}&limit=25`,
-            {},
-            // Suggestions are optional and must never hold the visible exact
-            // username result for several seconds when Roblox throttles them.
-            // Increased timeout to 4000ms to handle deployed server latency.
-            { retries: 0, timeoutMs: 2500 }
-        );
-        if (!response.ok) {
-            throw new RobloxUpstreamError(`Roblox keyword API returned ${response.status}`, { status: response.status });
-        }
-        const payload = await readRobloxJson(response, 'keyword search');
-        if (!payload || !Array.isArray(payload.data)) {
-            throw new RobloxUpstreamError('Roblox keyword response was incomplete', { status: response.status });
-        }
-        const users = payload.data.map(normalizeRobloxUser).filter(Boolean).slice(0, 25);
-        keywordCache.set(cacheKey, users, SEARCH_CACHE_TTL_MS);
-        return users;
-    } catch (error) {
-        // Keyword results are an optional convenience. Exact username lookup above
-        // remains authoritative, so throttling here must not fail the whole request.
-        keywordCache.set(cacheKey, [], 30 * 1000);
-        if (error && Number.isFinite(error.retryAfterMs)) {
-            nextKeywordProbeAt = Math.max(nextKeywordProbeAt, Date.now() + error.retryAfterMs);
-        }
-        if (error && error.status === 429) {
-            if (Date.now() - (lookupKeywordUsers._lastCooldownLog || 0) > 55000) {
-                lookupKeywordUsers._lastCooldownLog = Date.now();
-                console.warn('Optional Roblox keyword search throttled (429).');
-            }
-        } else {
-            console.warn(`Optional Roblox keyword search unavailable: ${error.message}`);
-        }
-        return [];
-    }
+async function lookupIndexedSuggestions(cleanUsername) {
+    const candidates = buildIndexedSearchCandidates(cleanUsername);
+    if (!candidates.length) return [];
+    // Suggestions are optional. Their failures use a separate circuit and
+    // must never block the essential exact-username lookup.
+    return lookupExactUsernames(candidates, {
+        retries: 0,
+        timeoutMs: 1200,
+        endpointKey: 'usernameSuggestions'
+    });
 }
 
 async function fetchAvatarMap(users, timeoutMs = SEARCH_AVATAR_TIMEOUT_MS) {
@@ -794,38 +709,41 @@ function rankSearchResults(users, cleanUsername) {
 }
 
 async function executePlayerSearch(cleanUsername, cacheKey) {
-    // Resolve the exact username and query-derived alternatives in one Roblox
-    // batch. The keyword endpoint is optional, globally paced, and never
-    // required for a successful player result.
-    const [batchResult, keywordUsers] = await Promise.all([
-        lookupSearchUserBatch(cleanUsername)
-            .then(users => ({ users }))
-            .catch(error => ({ error })),
-        lookupKeywordUsers(cleanUsername)
-    ]);
-    const batchUsers = batchResult.users || [];
+    // Exact existence is authoritative. A missing exact username is a real
+    // 404 and does not depend on the optional similar-player lookup.
+    const exactUsers = await lookupExactUsername(cleanUsername);
+    if (exactUsers.length === 0) {
+        const result = {
+            // A missing username is a normal search result, not a broken HTTP
+            // request. Returning 200 keeps DevTools clean while the frontend
+            // renders the same "No results found" empty state.
+            status: 200,
+            body: { success: true, count: 0, message: "No results found", code: "PLAYER_NOT_FOUND", users: [] }
+        };
+        searchCache.set(cacheKey, result, NEGATIVE_SEARCH_CACHE_TTL_MS);
+        return result;
+    }
 
-    // Both sources empty: if the exact lookup itself blew up, that is an
-    // upstream outage (stale cache / 503 path) — not "player not found".
-    if (!batchUsers.length && !keywordUsers.length && batchResult.error) {
-        throw batchResult.error;
+    let suggestionUsers = [];
+    let suggestionsFailed = false;
+    try {
+        suggestionUsers = await lookupIndexedSuggestions(cleanUsername);
+    } catch (error) {
+        suggestionsFailed = true;
+        if (Date.now() - (executePlayerSearch._lastSuggestionErrorLog || 0) > 55000) {
+            executePlayerSearch._lastSuggestionErrorLog = Date.now();
+            console.warn(`Optional player suggestions unavailable: ${error.message}`);
+        }
     }
 
     const merged = [];
     const seen = new Set();
-    for (const user of [...batchUsers, ...keywordUsers]) {
+    for (const user of [...exactUsers, ...suggestionUsers]) {
         if (!user || seen.has(user.id)) continue;
         seen.add(user.id);
         merged.push(user);
     }
     const users = rankSearchResults(merged, cleanUsername).slice(0, MAX_SEARCH_RESULTS);
-
-    if (users.length === 0) {
-        // Return 404 Not Found for definitive player miss according to established API contract
-        const result = { status: 404, body: { success: false, error: "Player not found", code: "PLAYER_NOT_FOUND", users: [] } };
-        searchCache.set(cacheKey, result, NEGATIVE_SEARCH_CACHE_TTL_MS);
-        return result;
-    }
 
     const stale = searchCache.getStale(cacheKey);
     const staleAvatars = {};
@@ -856,7 +774,12 @@ async function executePlayerSearch(cleanUsername, cacheKey) {
         status: 200,
         body: { success: true, count: results.length, users: results }
     };
-    searchCache.set(cacheKey, result, SEARCH_CACHE_TTL_MS, SEARCH_CACHE_STALE_MS);
+    searchCache.set(
+        cacheKey,
+        result,
+        suggestionsFailed ? 30 * 1000 : SEARCH_CACHE_TTL_MS,
+        SEARCH_CACHE_STALE_MS
+    );
     return result;
 }
 
@@ -986,12 +909,22 @@ async function handleRequest(req, res) {
         const username = url.searchParams.get("username");
 
         if (!username || !username.trim()) {
-            return sendJson(res, 200, { success: false, error: "Username is required" });
+            return sendJson(res, 400, {
+                success: false,
+                error: "Enter a valid Roblox username.",
+                code: "INVALID_USERNAME",
+                retryable: false
+            });
         }
 
         const cleanUsername = username.trim();
-        if (cleanUsername.length > 20 || !/^[a-zA-Z0-9_]+$/.test(cleanUsername)) {
-            return sendJson(res, 200, { success: false, error: "Invalid username format." });
+        if (!/^[a-zA-Z0-9_]{3,20}$/.test(cleanUsername)) {
+            return sendJson(res, 400, {
+                success: false,
+                error: "Enter a valid Roblox username.",
+                code: "INVALID_USERNAME",
+                retryable: false
+            });
         }
 
         console.log(`[Search] User is searching for: "${cleanUsername}"`);
@@ -1107,14 +1040,12 @@ function createServer() {
 function resetStateForTests() {
     searchCache.clear();
     profileCache.clear();
-    keywordCache.clear();
     searchInFlight.clear();
     profileInFlight.clear();
     rateLimitMap.clear();
     searchAbuseBlocks.clear();
     friendBootstrapDailyMap.clear();
     globalSearchWindow = { start: 0, count: 0 };
-    nextKeywordProbeAt = 0;
 }
 
 if (require.main === module) {
