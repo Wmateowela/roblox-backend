@@ -839,22 +839,99 @@ function sendTemporaryFailure(res, error, operation) {
     }, { "Retry-After": String(retryAfterSeconds) });
 }
 
+const DEFAULT_ALLOWED_ORIGINS = [
+    'https://pathan-sand.vercel.app',
+    'https://nmc-key.vercel.app',
+    'https://buyrobux-store.pages.dev',
+    'https://robox-6nc.pages.dev',
+    'https://pathan-keys.pages.dev',
+];
+
+function getAllowedOrigins() {
+    const fromEnv = (process.env.CORS_ALLOWED_ORIGINS || "")
+        .split(",")
+        .map(s => s.trim().replace(/\/+$/, "").toLowerCase())
+        .filter(Boolean);
+    return new Set([...DEFAULT_ALLOWED_ORIGINS.map(s => s.toLowerCase()), ...fromEnv]);
+}
+
+function isLoopback(hostname) {
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
+}
+
+function isOriginAllowed(originStr) {
+    if (!originStr) return false;
+    try {
+        const u = new URL(originStr);
+        if (isLoopback(u.hostname)) return true;
+        const allowed = getAllowedOrigins();
+        return allowed.has(u.origin.toLowerCase());
+    } catch (e) {
+        return false;
+    }
+}
+
+function getClientDomain(req) {
+    if (req.headers.origin) {
+        try {
+            return new URL(req.headers.origin).origin.toLowerCase();
+        } catch (e) {}
+    }
+    if (req.headers.referer) {
+        try {
+            return new URL(req.headers.referer).origin.toLowerCase();
+        } catch (e) {}
+    }
+    return null;
+}
+
 async function handleRequest(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-
-    // CORS Headers - Allow Store domain, localhost, and any origin
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-access-key");
+    const clientDomain = getClientDomain(req);
+    const reqOrigin = req.headers.origin ? String(req.headers.origin).trim() : null;
 
     // 🔒 Security headers
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
 
+    // Dynamic CORS Headers based on domain whitelist
+    if (reqOrigin && isOriginAllowed(reqOrigin)) {
+        res.setHeader("Access-Control-Allow-Origin", reqOrigin);
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-access-key");
+        res.setHeader("Vary", "Origin");
+    }
+
+    // Handle Preflight OPTIONS
     if (req.method === "OPTIONS") {
-        res.writeHead(204);
-        return res.end();
+        if (!reqOrigin || isOriginAllowed(reqOrigin)) {
+            res.setHeader("Access-Control-Max-Age", "86400");
+            res.writeHead(204);
+            return res.end();
+        }
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ success: false, error: "Access denied: Unauthorized domain." }));
+    }
+
+    // Health and probe endpoints (Render health checks, ping)
+    const isHealthProbe = (
+        url.pathname === "/" ||
+        url.pathname === "/health" ||
+        url.pathname === "/api/health" ||
+        url.pathname === "/api/ping" ||
+        url.pathname === "/ping"
+    );
+
+    // If it's NOT a health probe, block unauthorized external domains
+    if (!isHealthProbe) {
+        if (clientDomain && !isOriginAllowed(clientDomain)) {
+            return sendJson(res, 403, {
+                success: false,
+                error: "Access denied: Requests from this domain are not authorized.",
+                code: "DOMAIN_FORBIDDEN"
+            });
+        }
     }
 
     // Search-only budget: profile details and health probes do not count as a
@@ -950,14 +1027,18 @@ async function handleRequest(req, res) {
         }
     }
 
-    // Health Check endpoint for Render and local probing
-    if (url.pathname === "/" || url.pathname === "/health" || url.pathname === "/api/health") {
+    // Health Check & Ping probe endpoint for Render, Admin Dashboard, and local probing
+    if (url.pathname === "/" || url.pathname === "/health" || url.pathname === "/api/health" || url.pathname === "/api/ping" || url.pathname === "/ping") {
+        const pingSource = url.searchParams.get("source") || req.headers["x-client-source"] || "Probe";
+        const clientIp = getClientIp(req);
+        console.log(`📡 [PING RECEIVED] Server health/ping probe from ${clientIp} | Source: "${pingSource}" | Time: ${new Date().toLocaleTimeString()}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ 
             status: "ok", 
             service: "buy-roblox-search-backend",
             message: "Buy Roblox API Backend is healthy and running!", 
-            timestamp: new Date().toISOString() 
+            timestamp: new Date().toISOString(),
+            pingReceived: true
         }));
     }
 
@@ -983,7 +1064,8 @@ async function handleRequest(req, res) {
             });
         }
 
-        console.log(`[Search] User is searching for: "${cleanUsername}"`);
+        const clientIp = getClientIp(req);
+        console.log(`🔍 [PLAYER SEARCH] Searching Roblox user: "${cleanUsername}" | Client IP: ${clientIp} | Time: ${new Date().toLocaleTimeString()}`);
 
         try {
             const result = await getPlayerSearchResult(cleanUsername);
