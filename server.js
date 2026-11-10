@@ -844,7 +844,9 @@ function sendTemporaryFailure(res, error, operation) {
 const DEFAULT_ALLOWED_ORIGINS = [
     'https://pathan-sand.vercel.app',
     'https://nmc-key.vercel.app',
-    'https://admin-pathan.vercel.app/',
+    'https://admin-pathan.vercel.app',
+    'https://buy-roblox-admin.onrender.com',
+    'https://buyrobux-store.pages.dev',
     'https://robox-6nc.pages.dev',
     'https://pathan-keys.pages.dev',
 ];
@@ -854,7 +856,8 @@ function getAllowedOrigins() {
         .split(",")
         .map(s => s.trim().replace(/\/+$/, "").toLowerCase())
         .filter(Boolean);
-    return new Set([...DEFAULT_ALLOWED_ORIGINS.map(s => s.toLowerCase()), ...fromEnv]);
+    const defaults = DEFAULT_ALLOWED_ORIGINS.map(s => s.trim().replace(/\/+$/, "").toLowerCase()).filter(Boolean);
+    return new Set([...defaults, ...fromEnv]);
 }
 
 function isLoopback(hostname) {
@@ -866,8 +869,9 @@ function isOriginAllowed(originStr) {
     try {
         const u = new URL(originStr);
         if (isLoopback(u.hostname)) return true;
+        const normalized = u.origin.toLowerCase().replace(/\/+$/, '');
         const allowed = getAllowedOrigins();
-        return allowed.has(u.origin.toLowerCase());
+        return allowed.has(normalized);
     } catch (e) {
         return false;
     }
