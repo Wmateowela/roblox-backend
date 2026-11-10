@@ -706,13 +706,15 @@ async function createRandomFriendProfiles() {
 function rankSearchResults(users, cleanUsername) {
     const needle = cleanUsername.toLowerCase();
     return users
-        .map((user, index) => ({ user, index, rank: (() => {
-            const name = user.name.toLowerCase();
-            if (name === needle) return 0;
-            if (name.startsWith(needle)) return 1;
-            if (name.includes(needle)) return 2;
-            return 3;
-        })() }))
+        .map((user, index) => ({
+            user, index, rank: (() => {
+                const name = user.name.toLowerCase();
+                if (name === needle) return 0;
+                if (name.startsWith(needle)) return 1;
+                if (name.includes(needle)) return 2;
+                return 3;
+            })()
+        }))
         .sort((a, b) => (a.rank - b.rank) || (a.index - b.index))
         .map(entry => entry.user);
 }
@@ -842,7 +844,7 @@ function sendTemporaryFailure(res, error, operation) {
 const DEFAULT_ALLOWED_ORIGINS = [
     'https://pathan-sand.vercel.app',
     'https://nmc-key.vercel.app',
-    'https://buyrobux-store.pages.dev',
+    'https://admin-pathan.vercel.app/',
     'https://robox-6nc.pages.dev',
     'https://pathan-keys.pages.dev',
 ];
@@ -875,12 +877,12 @@ function getClientDomain(req) {
     if (req.headers.origin) {
         try {
             return new URL(req.headers.origin).origin.toLowerCase();
-        } catch (e) {}
+        } catch (e) { }
     }
     if (req.headers.referer) {
         try {
             return new URL(req.headers.referer).origin.toLowerCase();
-        } catch (e) {}
+        } catch (e) { }
     }
     return null;
 }
@@ -1033,10 +1035,10 @@ async function handleRequest(req, res) {
         const clientIp = getClientIp(req);
         console.log(`📡 [PING RECEIVED] Server health/ping probe from ${clientIp} | Source: "${pingSource}" | Time: ${new Date().toLocaleTimeString()}`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({ 
-            status: "ok", 
+        return res.end(JSON.stringify({
+            status: "ok",
             service: "buy-roblox-search-backend",
-            message: "Buy Roblox API Backend is healthy and running!", 
+            message: "Buy Roblox API Backend is healthy and running!",
             timestamp: new Date().toISOString(),
             pingReceived: true
         }));
@@ -1140,9 +1142,9 @@ async function handleRequest(req, res) {
         if (err) {
             if (url.pathname === "/") {
                 res.writeHead(200, { "Content-Type": "application/json" });
-                return res.end(JSON.stringify({ 
-                    status: "online", 
-                    message: "Buy Roblox API Server is running!" 
+                return res.end(JSON.stringify({
+                    status: "online",
+                    message: "Buy Roblox API Server is running!"
                 }));
             }
             if (err.code === "ENOENT") {
