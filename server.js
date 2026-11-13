@@ -1006,6 +1006,36 @@ async function handleRequest(req, res) {
         }
     }
 
+    if (url.pathname === "/api/player-presence") {
+        if (req.method !== "GET" && req.method !== "POST") {
+            return sendJson(res, 405, { success: false, error: "Method not allowed" }, { "Allow": "GET, POST" });
+        }
+        let userIds = [];
+        if (req.method === "GET") {
+            userIds = String(url.searchParams.get("userIds") || "").split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n) && n > 0);
+        } else {
+            try {
+                const body = JSON.parse(await readRequestBody(req));
+                if (Array.isArray(body.userIds)) userIds = body.userIds.map(Number).filter(n => Number.isFinite(n) && n > 0);
+            } catch (e) {}
+        }
+        if (!userIds.length) {
+            return sendJson(res, 200, { success: true, userPresences: [] });
+        }
+        try {
+            const robloxRes = await fetchRoblox("https://presence.roblox.com/v1/presence/users", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ userIds })
+            }, { endpointKey: "presence" });
+            const data = await readRobloxJson(robloxRes, "presence");
+            return sendJson(res, 200, { success: true, userPresences: data.userPresences || [] });
+        } catch (err) {
+            console.warn("Presence error:", err.message);
+            return sendJson(res, 200, { success: true, userPresences: [] });
+        }
+    }
+
     if (url.pathname === "/api/friends-bootstrap") {
         if (req.method !== "POST") {
             return sendJson(res, 405, { success: false, error: "Method not allowed" }, { "Allow": "POST" });
