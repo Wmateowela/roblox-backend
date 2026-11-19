@@ -843,7 +843,9 @@ function sendTemporaryFailure(res, error, operation) {
 
 const DEFAULT_ALLOWED_ORIGINS = [
     'https://pathan-sand.vercel.app',
+    'https://nmc-pass.vercel.app',
     'https://nmc-key.vercel.app',
+    'https://nmc-ads.pages.dev',
     'https://admin-pathan.vercel.app',
     'https://buy-roblox-admin.onrender.com',
     'https://buyrobux-store.pages.dev',
@@ -851,13 +853,47 @@ const DEFAULT_ALLOWED_ORIGINS = [
     'https://pathan-keys.pages.dev',
 ];
 
+const dynamicAdminOrigins = new Set();
+async function syncDynamicAdminOrigins() {
+    const bases = [
+        process.env.API_KEY_BACKEND_URL,
+        'https://api-keysystem.onrender.com',
+        'https://api-keysystem-bbbf.onrender.com'
+    ].map(u => String(u || '').trim().replace(/\/+$/, '')).filter(Boolean);
+
+    for (const base of bases) {
+        try {
+            const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            const timer = ctrl ? setTimeout(() => ctrl.abort(), 5000) : null;
+            const resp = await fetch(`${base}/api/store-domains`, { signal: ctrl ? ctrl.signal : undefined });
+            if (timer) clearTimeout(timer);
+            if (!resp.ok) continue;
+            const data = await resp.json().catch(() => null);
+            const d = data && data.domains;
+            if (!d) continue;
+            const urls = [d.primaryStoreUrl, d.keyGatewayUrl, ...(Array.isArray(d.allowedDomains) ? d.allowedDomains : [])];
+            for (const raw of urls) {
+                try {
+                    const parsed = new URL(String(raw || '').trim());
+                    if (parsed.protocol === 'https:') {
+                        dynamicAdminOrigins.add(parsed.origin.toLowerCase());
+                    }
+                } catch (e) {}
+            }
+            return;
+        } catch (e) {}
+    }
+}
+syncDynamicAdminOrigins().catch(() => {});
+setInterval(() => { syncDynamicAdminOrigins().catch(() => {}); }, 60 * 1000);
+
 function getAllowedOrigins() {
     const fromEnv = (process.env.CORS_ALLOWED_ORIGINS || "")
         .split(",")
         .map(s => s.trim().replace(/\/+$/, "").toLowerCase())
         .filter(Boolean);
     const defaults = DEFAULT_ALLOWED_ORIGINS.map(s => s.trim().replace(/\/+$/, "").toLowerCase()).filter(Boolean);
-    return new Set([...defaults, ...fromEnv]);
+    return new Set([...defaults, ...fromEnv, ...dynamicAdminOrigins]);
 }
 
 function isLoopback(hostname) {
